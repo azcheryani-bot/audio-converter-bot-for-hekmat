@@ -5,7 +5,6 @@ import json
 import subprocess
 import requests
 
-# نمایش آنی تمام لاگ‌ها در کنسول گیت‌هاب
 sys.stdout.reconfigure(line_buffering=True)
 
 RUBIKA_TOKEN = "CDJJFE0VZBQFANITRNGPDRBAJXSJBUVJSJOEJFQOJNAKSBFYHCDRPRQRMUVIUBDO"
@@ -15,6 +14,11 @@ PASSWORDS = ["313hekmat", "۳۱۳hekmat"]
 RUBIKA_API = f"https://botapi.rubika.ir/v3/{RUBIKA_TOKEN}"
 BALE_API = f"https://tapi.bale.ai/bot{BALE_TOKEN}"
 DATA_FILE = "bot_data.json"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "*/*"
+}
 
 def normalize(text):
     if not text:
@@ -31,7 +35,7 @@ def load_data():
                 return json.load(f)
         except Exception:
             pass
-    return {"auth_users": [], "bale_chat_id": None}
+    return {"auth_users": [], "bale_chat_id": 270871838}
 
 def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -43,8 +47,7 @@ def send_rubika_msg(chat_id, text):
     url = f"{RUBIKA_API}/sendMessage"
     payload = {"chat_id": str(chat_id), "text": text}
     try:
-        r = requests.post(url, json=payload, timeout=10)
-        print(f"[Rubika Send] to {chat_id}: status={r.status_code}, resp={r.text}", flush=True)
+        requests.post(url, json=payload, headers=HEADERS, timeout=10)
     except Exception as e:
         print(f"[Rubika Send Error]: {e}", flush=True)
 
@@ -52,7 +55,7 @@ def get_rubika_file_url(file_id):
     url = f"{RUBIKA_API}/getFile"
     payload = {"file_id": str(file_id)}
     try:
-        res = requests.post(url, json=payload, timeout=15).json()
+        res = requests.post(url, json=payload, headers=HEADERS, timeout=15).json()
         data_obj = res.get("data", {}) if isinstance(res.get("data"), dict) else res
         return data_obj.get("download_url") or res.get("download_url")
     except Exception as e:
@@ -73,7 +76,7 @@ def send_bale_audio(chat_id, file_path, title="Audio"):
         with open(file_path, "rb") as f:
             files = {"audio": (os.path.basename(file_path), f, "audio/mpeg")}
             data = {"chat_id": chat_id, "caption": f"🎵 {title}"}
-            res = requests.post(url, data=data, files=files, timeout=180)
+            res = requests.post(url, data=data, files=files, timeout=300)
             return res.json().get("ok", False)
     except Exception as e:
         print(f"[Bale Audio Error]: {e}", flush=True)
@@ -90,69 +93,107 @@ def get_audio_duration(file_path):
     except Exception:
         return 0.0
 
-def convert_to_mp3(input_path, output_path):
-    cmd = ["ffmpeg", "-y", "-i", input_path, "-vn", "-c:a", "libmp3lame", "-b:a", "128k", output_path]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def convert_to_mp3(input_path, output_path, target_kbps="96k"):
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-vn", "-c:a", "libmp3lame", "-b:a", target_kbps,
+        output_path
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res.returncode != 0:
+        print(f"[FFmpeg Error]: {res.stderr}", flush=True)
+        return False
+    return True
 
-def compress_audio(input_path, output_path, target_size_mb=48):
-    duration = get_audio_duration(input_path)
+def compress_audio(input_path, output_path, duration, target_size_mb=47):
     if duration <= 0:
-        cmd = ["ffmpeg", "-y", "-i", input_path, "-vn", "-c:a", "libmp3lame", "-b:a", "48k", output_path]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return
-
+        duration = get_audio_duration(input_path)
+    if duration <= 0:
+        duration = 3600 # پیش‌فرض یک ساعت
+    
+    # محاسبه دقیق بیت‌ریت برای رسیدن به زیر ۵۰ مگابایت
     target_bytes = target_size_mb * 1024 * 1024
     bitrate_kbps = int((target_bytes * 8) / duration / 1000)
-    bitrate_kbps = max(24, min(bitrate_kbps, 128))
-
-    cmd = ["ffmpeg", "-y", "-i", input_path, "-vn", "-c:a", "libmp3lame", "-b:a", f"{bitrate_kbps}k", output_path]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    bitrate_kbps = max(24, min(bitrate_kbps, 96))
+    
+    print(f"[Compressing] Target bitrate: {bitrate_kbps}k for duration: {duration}s", flush=True)
+    return convert_to_mp3(input_path, output_path, target_kbps=f"{bitrate_kbps}k")
 
 def process_and_forward(file_id, original_name, rubika_chat_id):
-    bale_chat_id = data_store.get("bale_chat_id")
-    if not bale_chat_id:
-        send_rubika_msg(rubika_chat_id, "⚠️ ابتدا یک پیام به ربات بله بفرستید تا شما را شناسایی کند.")
-        return
+    bale_chat_id = data_store.get("bale_chat_id") or 270871838
 
-    send_rubika_msg(rubika_chat_id, "⏳ در حال دریافت فایل...")
+    send_rubika_msg(rubika_chat_id, "⏳ در حال دانلود فایل از روبیکا...")
     download_url = get_rubika_file_url(file_id)
     if not download_url:
-        send_rubika_msg(rubika_chat_id, "❌ دریافت آدرس دانلود با خطا مواجه شد.")
+        send_rubika_msg(rubika_chat_id, "❌ دریافت آدرس فایل با خطا مواجه شد.")
         return
 
-    raw_path = f"raw_{file_id}"
+    # استخراج پسوند فایل ورودی
+    ext = os.path.splitext(original_name)[1]
+    if not ext:
+        ext = ".m4a"
+    raw_path = f"raw_{file_id}{ext}"
     mp3_path = f"out_{file_id}.mp3"
     comp_path = f"comp_{file_id}.mp3"
 
     try:
-        with requests.get(download_url, stream=True, timeout=90) as r:
+        # دانلود با هویت مرورگر
+        with requests.get(download_url, headers=HEADERS, stream=True, timeout=180) as r:
+            if r.status_code != 200:
+                print(f"[Download Blocked] Code: {r.status_code}, Response: {r.text[:200]}", flush=True)
+                send_rubika_msg(rubika_chat_id, f"❌ سرور روبیکا اجازه دانلود نداد (کد: {r.status_code})")
+                return
             with open(raw_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=16384):
-                    f.write(chunk)
+                for chunk in r.iter_content(chunk_size=32768):
+                    if chunk:
+                        f.write(chunk)
 
-        send_rubika_msg(rubika_chat_id, "🔄 در حال تبدیل به MP3...")
-        convert_to_mp3(raw_path, mp3_path)
+        downloaded_size = os.path.getsize(raw_path)
+        print(f"[Downloaded File]: {raw_path} | Size: {downloaded_size} bytes", flush=True)
+
+        if downloaded_size < 1000:
+            send_rubika_msg(rubika_chat_id, "❌ فایل دریافتی ناقص است.")
+            return
+
+        send_rubika_msg(rubika_chat_id, "🔄 در حال تبدیل به صوت MP3...")
+        
+        # بررسی طول صوت
+        duration = get_audio_duration(raw_path)
+        print(f"[Audio Duration]: {duration} seconds", flush=True)
+
+        # تبدیل با بیت‌ریت استاندارد ۹۶ کیلوبیت
+        success = convert_to_mp3(raw_path, mp3_path, target_kbps="96k")
+        if not success or not os.path.exists(mp3_path):
+            send_rubika_msg(rubika_chat_id, "❌ تبدیل فایل صوتی انجام نشد.")
+            return
+
         final_file = mp3_path
-
         size_mb = os.path.getsize(mp3_path) / (1024 * 1024)
-        if size_mb > 49.0:
-            send_rubika_msg(rubika_chat_id, f"📦 حجم فایل ({size_mb:.1f}MB) بیش از حد بله است؛ در حال فشرده‌سازی...")
-            compress_audio(mp3_path, comp_path, target_size_mb=48)
-            final_file = comp_path
+        print(f"[Converted MP3 Size]: {size_mb:.2f} MB", flush=True)
 
-        send_rubika_msg(rubika_chat_id, "🚀 در حال تحویل به ربات بله...")
-        if send_bale_audio(bale_chat_id, final_file, title=original_name or "Voice"):
+        # اگر بعد از تبدیل، حجم فایل بالاتر از ۴۸ مگ بود فشرده شود
+        if size_mb > 48.0:
+            send_rubika_msg(rubika_chat_id, f"📦 حجم فایل ({size_mb:.1f}MB) بیش از حد بله است؛ در حال فشرده‌سازی خودکار...")
+            compress_audio(raw_path, comp_path, duration, target_size_mb=46)
+            if os.path.exists(comp_path):
+                final_file = comp_path
+
+        send_rubika_msg(rubika_chat_id, "🚀 در حال ارسال به بازوی بله...")
+        if send_bale_audio(bale_chat_id, final_file, title=original_name or "درس اسفار"):
             send_rubika_msg(rubika_chat_id, "✅ فایل با موفقیت در بله تحویل داده شد!")
         else:
-            send_rubika_msg(rubika_chat_id, "❌ خطایی در ارسال به بله رخ داد.")
+            send_rubika_msg(rubika_chat_id, "❌ خطایی در آپلود نهایی به بله رخ داد.")
 
     except Exception as e:
         print(f"Error processing: {e}", flush=True)
-        send_rubika_msg(rubika_chat_id, "❌ خطا در پردازش فایل.")
+        send_rubika_msg(rubika_chat_id, f"❌ خطا: {e}")
     finally:
         for p in [raw_path, mp3_path, comp_path]:
             if os.path.exists(p):
-                os.remove(p)
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
 
 def check_bale_updates(offset):
     try:
@@ -165,14 +206,13 @@ def check_bale_updates(offset):
                 if cid and data_store.get("bale_chat_id") != cid:
                     data_store["bale_chat_id"] = cid
                     save_data(data_store)
-                    print(f"[Bale Connected] Chat ID: {cid}", flush=True)
-                    send_bale_msg(cid, "✅ ربات آماده دریافت فایل‌های روبیکا است!")
+                    send_bale_msg(cid, "✅ شناسه بله شما بروزرسانی شد.")
     except Exception:
         pass
     return offset
 
 def run_bot():
-    print(">>> ربات با موفقیت فعال شد و در حال شنود است...", flush=True)
+    print(">>> ربات با تنظیمات جدید راه‌اندازی شد...", flush=True)
     rubika_offset = None
     bale_offset = 0
 
@@ -184,17 +224,15 @@ def run_bot():
             if rubika_offset:
                 payload["offset_id"] = str(rubika_offset)
 
-            r = requests.post(f"{RUBIKA_API}/getUpdates", json=payload, timeout=10)
+            r = requests.post(f"{RUBIKA_API}/getUpdates", json=payload, headers=HEADERS, timeout=10)
             res = r.json()
 
-            # استخراج ساختار داده روبیکا
             data_obj = res.get("data", {}) if isinstance(res.get("data"), dict) else res
             updates = data_obj.get("updates") or []
             if data_obj.get("next_offset_id"):
                 rubika_offset = data_obj.get("next_offset_id")
 
             for item in updates:
-                # پشتیبانی از ساختارهای مختلف Update
                 upd = item.get("update", item)
                 msg = upd.get("new_message", {})
                 chat_id = upd.get("chat_id")
@@ -204,23 +242,23 @@ def run_bot():
                 file_info = msg.get("file")
 
                 if norm_text == "/start":
-                    send_rubika_msg(chat_id, "سلام! خوش آمدید.\nلطفاً رمز عبور را ارسال کنید:")
+                    send_rubika_msg(chat_id, "سلام! لطفاً رمز عبور را بفرستید:")
                     continue
 
                 if norm_text == "313hekmat":
                     if sender_id not in data_store["auth_users"]:
                         data_store["auth_users"].append(sender_id)
                         save_data(data_store)
-                    send_rubika_msg(chat_id, "🔓 رمز تایید شد!\nاز حالا هر فایلی بفرستید، به فایل صوتی MP3 تبدیل شده و در بله تحویلتان داده می‌شود.")
+                    send_rubika_msg(chat_id, "🔓 رمز تایید شد! فایل‌های خود را ارسال کنید.")
                     continue
 
                 if sender_id not in data_store["auth_users"]:
-                    send_rubika_msg(chat_id, "🔒 دسترسی مسدود است. لطفاً ابتدا رمز عبور را ارسال کنید.")
+                    send_rubika_msg(chat_id, "🔒 لطفاً ابتدا رمز عبور را ارسال کنید.")
                     continue
 
                 if file_info:
                     file_id = file_info.get("file_id")
-                    file_name = file_info.get("file_name", "audio.mp3")
+                    file_name = file_info.get("file_name", "audio.m4a")
                     process_and_forward(file_id, file_name, chat_id)
 
         except Exception as e:
