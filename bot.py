@@ -2,14 +2,17 @@ import os
 import sys
 import time
 import json
+import queue
+import threading
 import subprocess
 import requests
 
 sys.stdout.reconfigure(line_buffering=True)
 
+# ==================== تنظیمات ====================
 RUBIKA_TOKEN = "CDJJFE0VZBQFANITRNGPDRBAJXSJBUVJSJOEJFQOJNAKSBFYHCDRPRQRMUVIUBDO"
 BALE_TOKEN = "628083238:xSdEBoOooDiIVRPwAfL8eOmxtOqIhGUk4DI"
-PASSWORDS = ["313hekmat", "۳۱۳hekmat"]
+PASSWORD = "313hekmat"
 
 RUBIKA_API = f"https://botapi.rubika.ir/v3/{RUBIKA_TOKEN}"
 BALE_API = f"https://tapi.bale.ai/bot{BALE_TOKEN}"
@@ -20,7 +23,8 @@ HEADERS = {
     "Accept": "*/*"
 }
 
-# حافظه برای جلوگیری از پردازش پیام‌های تکراری روبیکا
+# صف پردازش فایل‌ها (دانلود و تبدیل ترتیبی)
+task_queue = queue.Queue()
 processed_messages = set()
 
 def normalize(text):
@@ -38,7 +42,8 @@ def load_data():
                 return json.load(f)
         except Exception:
             pass
-    return {"auth_users": [], "bale_chat_id": 270871838}
+    # ساختار: نگهداری مشخصات هر کاربر روبیکا و آیدی بله متناظر آن
+    return {"users": {}}
 
 def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -46,6 +51,7 @@ def save_data(data):
 
 data_store = load_data()
 
+# ==================== ارتباط با روبیکا ====================
 def send_rubika_msg(chat_id, text):
     url = f"{RUBIKA_API}/sendMessage"
     payload = {"chat_id": str(chat_id), "text": text}
@@ -65,6 +71,7 @@ def get_rubika_file_url(file_id):
         print(f"[Rubika File Error]: {e}", flush=True)
         return None
 
+# ==================== ارتباط با بله ====================
 def send_bale_msg(chat_id, text):
     url = f"{BALE_API}/sendMessage"
     payload = {"chat_id": chat_id, "text": text}
@@ -73,7 +80,7 @@ def send_bale_msg(chat_id, text):
     except Exception as e:
         print(f"[Bale Send Error]: {e}", flush=True)
 
-def send_bale_audio(chat_id, file_path, title="Audio"):
+def send_bale_audio(chat_id, file_path, title="صوت"):
     url = f"{BALE_API}/sendAudio"
     try:
         with open(file_path, "rb") as f:
@@ -85,6 +92,7 @@ def send_bale_audio(chat_id, file_path, title="Audio"):
         print(f"[Bale Audio Error]: {e}", flush=True)
         return False
 
+# ==================== ابزارهای تبدیل و فشرده‌سازی ====================
 def get_audio_duration(file_path):
     try:
         cmd = [
@@ -108,21 +116,22 @@ def convert_to_mp3(input_path, output_path, target_kbps="96k"):
 def compress_audio(input_path, output_path, duration, target_size_mb=47):
     if duration <= 0:
         duration = get_audio_duration(input_path) or 3600
-    
     target_bytes = target_size_mb * 1024 * 1024
     bitrate_kbps = int((target_bytes * 8) / duration / 1000)
     bitrate_kbps = max(24, min(bitrate_kbps, 96))
-    
-    print(f"[Compressing] Bitrate: {bitrate_kbps}k", flush=True)
     return convert_to_mp3(input_path, output_path, target_kbps=f"{bitrate_kbps}k")
 
-def process_and_forward(file_id, original_name, rubika_chat_id):
-    bale_chat_id = data_store.get("bale_chat_id") or 270871838
+# ==================== تسک پردازش فایل ====================
+def process_single_task(task):
+    file_id = task["file_id"]
+    original_name = task["original_name"]
+    rubika_chat_id = task["rubika_chat_id"]
+    bale_chat_id = task["bale_chat_id"]
 
-    send_rubika_msg(rubika_chat_id, "⏳ در حال دانلود فایل از روبیکا...")
+    send_rubika_msg(rubika_chat_id, "⏳ دانلود فایل شما آغاز شد...")
     download_url = get_rubika_file_url(file_id)
     if not download_url:
-        send_rubika_msg(rubika_chat_id, "❌ دریافت آدرس فایل با خطا مواجه شد.")
+        send_rubika_msg(rubika_chat_id, "❌ خطا در دریافت لینک مستقیم فایل از روبیکا.")
         return
 
     ext = os.path.splitext(original_name)[1] or ".m4a"
@@ -133,47 +142,42 @@ def process_and_forward(file_id, original_name, rubika_chat_id):
     try:
         with requests.get(download_url, headers=HEADERS, stream=True, timeout=180) as r:
             if r.status_code != 200:
-                send_rubika_msg(rubika_chat_id, f"❌ سرور روبیکا اجازه دانلود نداد ({r.status_code})")
+                send_rubika_msg(rubika_chat_id, f"❌ سرور دانلود اجازه نداد ({r.status_code})")
                 return
             with open(raw_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=32768):
                     if chunk:
                         f.write(chunk)
 
-        downloaded_size = os.path.getsize(raw_path)
-        print(f"[Downloaded]: {raw_path} ({downloaded_size} bytes)", flush=True)
-
-        if downloaded_size < 1000:
+        if os.path.getsize(raw_path) < 1000:
             send_rubika_msg(rubika_chat_id, "❌ فایل دریافتی ناقص است.")
             return
 
-        send_rubika_msg(rubika_chat_id, "🔄 در حال تبدیل به صوت MP3...")
+        send_rubika_msg(rubika_chat_id, "🔄 در حال تبدیل به فرمت MP3...")
         duration = get_audio_duration(raw_path)
         success = convert_to_mp3(raw_path, mp3_path, target_kbps="96k")
-        
         if not success or not os.path.exists(mp3_path):
-            send_rubika_msg(rubika_chat_id, "❌ تبدیل فایل انجام نشد.")
+            send_rubika_msg(rubika_chat_id, "❌ خطایی در فرایند تبدیل صوت رخ داد.")
             return
 
         final_file = mp3_path
         size_mb = os.path.getsize(mp3_path) / (1024 * 1024)
-        print(f"[Converted MP3 Size]: {size_mb:.2f} MB", flush=True)
 
         if size_mb > 48.0:
-            send_rubika_msg(rubika_chat_id, f"📦 حجم فایل ({size_mb:.1f}MB) بالا است؛ در حال فشرده‌سازی...")
+            send_rubika_msg(rubika_chat_id, f"📦 حجم فایل ({size_mb:.1f}MB) بالا بود؛ فشرده‌سازی خودکار انجام شد.")
             compress_audio(raw_path, comp_path, duration, target_size_mb=46)
             if os.path.exists(comp_path):
                 final_file = comp_path
 
-        send_rubika_msg(rubika_chat_id, "🚀 در حال ارسال به بازوی بله...")
-        if send_bale_audio(bale_chat_id, final_file, title=original_name or "صوت"):
-            send_rubika_msg(rubika_chat_id, "✅ فایل با موفقیت در بله تحویل داده شد!")
+        send_rubika_msg(rubika_chat_id, "🚀 در حال تحویل صوت به حساب بله شما...")
+        if send_bale_audio(bale_chat_id, final_file, title=original_name or "صوت تبدیل شده"):
+            send_rubika_msg(rubika_chat_id, "✅ فایل با موفقیت به بله شما تحویل داده شد!")
         else:
-            send_rubika_msg(rubika_chat_id, "❌ خطایی در ارسال به بله رخ داد.")
+            send_rubika_msg(rubika_chat_id, "❌ خطا در تحویل فایل به بله (اطمینان حاصل کنید ربات بله را مسدود نکرده باشید).")
 
     except Exception as e:
-        print(f"Error: {e}", flush=True)
-        send_rubika_msg(rubika_chat_id, f"❌ خطا: {e}")
+        print(f"[Task Error]: {e}", flush=True)
+        send_rubika_msg(rubika_chat_id, f"❌ خطا در پردازش: {e}")
     finally:
         for p in [raw_path, mp3_path, comp_path]:
             if os.path.exists(p):
@@ -182,6 +186,18 @@ def process_and_forward(file_id, original_name, rubika_chat_id):
                 except Exception:
                     pass
 
+# حلقه پس‌زمینه برای خواندن نوبتی صف
+def queue_worker():
+    while True:
+        task = task_queue.get()
+        try:
+            process_single_task(task)
+        except Exception as e:
+            print(f"[Worker Exception]: {e}", flush=True)
+        finally:
+            task_queue.task_done()
+
+# ==================== دریافت پیام‌های بله ====================
 def check_bale_updates(offset):
     try:
         res = requests.get(f"{BALE_API}/getUpdates", params={"offset": offset, "timeout": 1}, timeout=4).json()
@@ -190,15 +206,29 @@ def check_bale_updates(offset):
                 offset = upd["update_id"] + 1
                 msg = upd.get("message", {})
                 cid = msg.get("chat", {}).get("id")
-                if cid and data_store.get("bale_chat_id") != cid:
-                    data_store["bale_chat_id"] = cid
-                    save_data(data_store)
+                first_name = msg.get("from", {}).get("first_name", "کاربر")
+                
+                # ارسال شناسه بله به کاربر برای ثبت در روبیکا
+                if cid:
+                    welcome_text = (
+                        f"سلام {first_name} عزیز!\n"
+                        f"شناسه بله (Chat ID) اختصاصی شما:\n\n"
+                        f"👉 `{cid}` 👈\n\n"
+                        f"این عدد را کپی کنید و در ربات روبیکا بفرستید تا حساب‌ها متصل شوند."
+                    )
+                    send_bale_msg(cid, welcome_text)
     except Exception:
         pass
     return offset
 
+# ==================== موتور اصلی ربات ====================
 def run_bot():
-    print(">>> ربات هوشمند با سیستم ضد تکرار فعال شد...", flush=True)
+    print(">>> ربات با سیستم صف و تفکیک کاربر فعال شد...", flush=True)
+    
+    # راه‌اندازی کارگر پردازش در یک Thread مجزا
+    worker_thread = threading.Thread(target=queue_worker, daemon=True)
+    worker_thread.start()
+
     rubika_offset = None
     bale_offset = 0
 
@@ -223,7 +253,7 @@ def run_bot():
                 msg = upd.get("new_message") or upd.get("updated_message") or {}
                 msg_id = msg.get("message_id")
 
-                # جلوگیری قطعی از پردازش دوباره یک پیام یکسان
+                # جلوگیری از پردازش پیام‌های تکراری
                 if msg_id:
                     if msg_id in processed_messages:
                         continue
@@ -237,30 +267,72 @@ def run_bot():
                 norm_text = normalize(raw_text)
                 file_info = msg.get("file")
 
+                # دریافت اطلاعات کاربر در دیتابیس
+                user_info = data_store["users"].get(str(sender_id), {"auth": False, "bale_id": None})
+
+                # شناسه کاربری قبلی شما به صورت پیش‌فرض برای سهولت
+                if str(sender_id) not in data_store["users"] and norm_text in ["313hekmat", "۳۱۳hekmat"]:
+                    user_info["bale_id"] = 270871838
+
+                # ۱. دستور استارت
                 if norm_text == "/start":
-                    send_rubika_msg(chat_id, "سلام! لطفاً رمز عبور را بفرستید:")
+                    send_rubika_msg(chat_id, "سلام! خوش آمدید.\nلطفاً رمز عبور را ارسال کنید:")
                     continue
 
-                if norm_text == "313hekmat":
-                    if sender_id not in data_store["auth_users"]:
-                        data_store["auth_users"].append(sender_id)
-                        save_data(data_store)
-                    send_rubika_msg(chat_id, "🔓 رمز تایید شد! فایل‌های خود را ارسال کنید.")
+                # ۲. ارسال رمز عبور
+                if "313hekmat" in norm_text:
+                    user_info["auth"] = True
+                    data_store["users"][str(sender_id)] = user_info
+                    save_data(data_store)
+                    
+                    if user_info.get("bale_id"):
+                        send_rubika_msg(chat_id, f"🔓 رمز تایید شد!\nحساب بله شما روی ({user_info['bale_id']}) تنظیم است.\nاکنون هر فایلی بفرستید در صف تبدیل قرار گرفته و به بله شما ارسال می‌شود.")
+                    else:
+                        send_rubika_msg(chat_id, "🔓 رمز تایید شد!\nحالا لطفاً شناسه بله (Chat ID) خود را بفرستید.\n(برای دریافت شناسه، در ربات بله پیام /start را بزنید).")
                     continue
 
-                if sender_id not in data_store["auth_users"]:
-                    send_rubika_msg(chat_id, "🔒 لطفاً ابتدا رمز عبور را ارسال کنید.")
+                # ۳. ارسال شناسه عددی بله
+                if norm_text.isdigit() and len(norm_text) >= 6:
+                    if not user_info.get("auth"):
+                        send_rubika_msg(chat_id, "🔒 لطفاً ابتدا رمز عبور را ارسال کنید.")
+                        continue
+                    user_info["bale_id"] = int(norm_text)
+                    data_store["users"][str(sender_id)] = user_info
+                    save_data(data_store)
+                    send_rubika_msg(chat_id, f"✅ حساب بله شما با موفقیت روی شناسه {norm_text} متصل شد!\nاز حالا هر فایلی بفرستید فقط به بله شخص شما ارسال خواهد شد.")
                     continue
 
+                # ۴. بررسی قفل بودن دسترسی
+                if not user_info.get("auth"):
+                    if file_info or norm_text:
+                        send_rubika_msg(chat_id, "🔒 دسترسی مسدود است. لطفاً ابتدا رمز عبور را بفرستید.")
+                    continue
+
+                # ۵. بررسی متصل بودن حساب بله
+                if not user_info.get("bale_id"):
+                    send_rubika_msg(chat_id, "⚠️ شما هنوز شناسه بله خود را وارد نکرده‌اید!\nلطفاً وارد ربات بله شده، دستور /start را بزنید و عدد دریافتی را اینجا ارسال کنید.")
+                    continue
+
+                # ۶. دریافت فایل و قرار دادن در صف نوبت
                 if file_info:
                     file_id = file_info.get("file_id")
                     file_name = file_info.get("file_name", "audio.m4a")
-                    process_and_forward(file_id, file_name, chat_id)
+                    
+                    # ثبت تسک در صف پردازش
+                    task_queue.put({
+                        "file_id": file_id,
+                        "original_name": file_name,
+                        "rubika_chat_id": chat_id,
+                        "bale_chat_id": user_info["bale_id"]
+                    })
+                    
+                    q_size = task_queue.qsize()
+                    send_rubika_msg(chat_id, f"📥 فایل شما در صف پردازش قرار گرفت (نوبت شما: {q_size})\nبه محض آماده شدن ارسال خواهد شد.")
 
         except Exception as e:
-            print(f"[Polling Error]: {e}", flush=True)
+            print(f"[Polling Loop Error]: {e}", flush=True)
 
-        time.sleep(2)
+        time.sleep(1.5)
 
 if __name__ == "__main__":
     run_bot()
