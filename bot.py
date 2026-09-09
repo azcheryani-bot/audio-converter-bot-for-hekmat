@@ -20,6 +20,9 @@ HEADERS = {
     "Accept": "*/*"
 }
 
+# حافظه برای جلوگیری از پردازش پیام‌های تکراری روبیکا
+processed_messages = set()
+
 def normalize(text):
     if not text:
         return ""
@@ -100,23 +103,17 @@ def convert_to_mp3(input_path, output_path, target_kbps="96k"):
         output_path
     ]
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if res.returncode != 0:
-        print(f"[FFmpeg Error]: {res.stderr}", flush=True)
-        return False
-    return True
+    return res.returncode == 0
 
 def compress_audio(input_path, output_path, duration, target_size_mb=47):
     if duration <= 0:
-        duration = get_audio_duration(input_path)
-    if duration <= 0:
-        duration = 3600 # پیش‌فرض یک ساعت
+        duration = get_audio_duration(input_path) or 3600
     
-    # محاسبه دقیق بیت‌ریت برای رسیدن به زیر ۵۰ مگابایت
     target_bytes = target_size_mb * 1024 * 1024
     bitrate_kbps = int((target_bytes * 8) / duration / 1000)
     bitrate_kbps = max(24, min(bitrate_kbps, 96))
     
-    print(f"[Compressing] Target bitrate: {bitrate_kbps}k for duration: {duration}s", flush=True)
+    print(f"[Compressing] Bitrate: {bitrate_kbps}k", flush=True)
     return convert_to_mp3(input_path, output_path, target_kbps=f"{bitrate_kbps}k")
 
 def process_and_forward(file_id, original_name, rubika_chat_id):
@@ -128,20 +125,15 @@ def process_and_forward(file_id, original_name, rubika_chat_id):
         send_rubika_msg(rubika_chat_id, "❌ دریافت آدرس فایل با خطا مواجه شد.")
         return
 
-    # استخراج پسوند فایل ورودی
-    ext = os.path.splitext(original_name)[1]
-    if not ext:
-        ext = ".m4a"
+    ext = os.path.splitext(original_name)[1] or ".m4a"
     raw_path = f"raw_{file_id}{ext}"
     mp3_path = f"out_{file_id}.mp3"
     comp_path = f"comp_{file_id}.mp3"
 
     try:
-        # دانلود با هویت مرورگر
         with requests.get(download_url, headers=HEADERS, stream=True, timeout=180) as r:
             if r.status_code != 200:
-                print(f"[Download Blocked] Code: {r.status_code}, Response: {r.text[:200]}", flush=True)
-                send_rubika_msg(rubika_chat_id, f"❌ سرور روبیکا اجازه دانلود نداد (کد: {r.status_code})")
+                send_rubika_msg(rubika_chat_id, f"❌ سرور روبیکا اجازه دانلود نداد ({r.status_code})")
                 return
             with open(raw_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=32768):
@@ -149,43 +141,38 @@ def process_and_forward(file_id, original_name, rubika_chat_id):
                         f.write(chunk)
 
         downloaded_size = os.path.getsize(raw_path)
-        print(f"[Downloaded File]: {raw_path} | Size: {downloaded_size} bytes", flush=True)
+        print(f"[Downloaded]: {raw_path} ({downloaded_size} bytes)", flush=True)
 
         if downloaded_size < 1000:
             send_rubika_msg(rubika_chat_id, "❌ فایل دریافتی ناقص است.")
             return
 
         send_rubika_msg(rubika_chat_id, "🔄 در حال تبدیل به صوت MP3...")
-        
-        # بررسی طول صوت
         duration = get_audio_duration(raw_path)
-        print(f"[Audio Duration]: {duration} seconds", flush=True)
-
-        # تبدیل با بیت‌ریت استاندارد ۹۶ کیلوبیت
         success = convert_to_mp3(raw_path, mp3_path, target_kbps="96k")
+        
         if not success or not os.path.exists(mp3_path):
-            send_rubika_msg(rubika_chat_id, "❌ تبدیل فایل صوتی انجام نشد.")
+            send_rubika_msg(rubika_chat_id, "❌ تبدیل فایل انجام نشد.")
             return
 
         final_file = mp3_path
         size_mb = os.path.getsize(mp3_path) / (1024 * 1024)
         print(f"[Converted MP3 Size]: {size_mb:.2f} MB", flush=True)
 
-        # اگر بعد از تبدیل، حجم فایل بالاتر از ۴۸ مگ بود فشرده شود
         if size_mb > 48.0:
-            send_rubika_msg(rubika_chat_id, f"📦 حجم فایل ({size_mb:.1f}MB) بیش از حد بله است؛ در حال فشرده‌سازی خودکار...")
+            send_rubika_msg(rubika_chat_id, f"📦 حجم فایل ({size_mb:.1f}MB) بالا است؛ در حال فشرده‌سازی...")
             compress_audio(raw_path, comp_path, duration, target_size_mb=46)
             if os.path.exists(comp_path):
                 final_file = comp_path
 
         send_rubika_msg(rubika_chat_id, "🚀 در حال ارسال به بازوی بله...")
-        if send_bale_audio(bale_chat_id, final_file, title=original_name or "درس اسفار"):
+        if send_bale_audio(bale_chat_id, final_file, title=original_name or "صوت"):
             send_rubika_msg(rubika_chat_id, "✅ فایل با موفقیت در بله تحویل داده شد!")
         else:
-            send_rubika_msg(rubika_chat_id, "❌ خطایی در آپلود نهایی به بله رخ داد.")
+            send_rubika_msg(rubika_chat_id, "❌ خطایی در ارسال به بله رخ داد.")
 
     except Exception as e:
-        print(f"Error processing: {e}", flush=True)
+        print(f"Error: {e}", flush=True)
         send_rubika_msg(rubika_chat_id, f"❌ خطا: {e}")
     finally:
         for p in [raw_path, mp3_path, comp_path]:
@@ -206,13 +193,12 @@ def check_bale_updates(offset):
                 if cid and data_store.get("bale_chat_id") != cid:
                     data_store["bale_chat_id"] = cid
                     save_data(data_store)
-                    send_bale_msg(cid, "✅ شناسه بله شما بروزرسانی شد.")
     except Exception:
         pass
     return offset
 
 def run_bot():
-    print(">>> ربات با تنظیمات جدید راه‌اندازی شد...", flush=True)
+    print(">>> ربات هوشمند با سیستم ضد تکرار فعال شد...", flush=True)
     rubika_offset = None
     bale_offset = 0
 
@@ -234,7 +220,17 @@ def run_bot():
 
             for item in updates:
                 upd = item.get("update", item)
-                msg = upd.get("new_message", {})
+                msg = upd.get("new_message") or upd.get("updated_message") or {}
+                msg_id = msg.get("message_id")
+
+                # جلوگیری قطعی از پردازش دوباره یک پیام یکسان
+                if msg_id:
+                    if msg_id in processed_messages:
+                        continue
+                    processed_messages.add(msg_id)
+                    if len(processed_messages) > 1000:
+                        processed_messages.clear()
+
                 chat_id = upd.get("chat_id")
                 sender_id = msg.get("sender_id")
                 raw_text = (msg.get("text") or "").strip()
