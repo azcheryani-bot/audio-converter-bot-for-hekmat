@@ -12,10 +12,9 @@ sys.stdout.reconfigure(line_buffering=True)
 BOT_START_TIME = int(time.time())
 
 # ==================== تنظیمات ====================
-RUBIKA_TOKEN = "CDJJFE0VZBQFANITRNGPDRBAJXSJBUVJSJOEJFQOJNAKSBFYHCDRPRQRMUVIUBDO"
-BALE_TOKEN = "628083238:xSdEBoOooDiIVRPwAfL8eOmxtOqIhGUk4DI"
-PASSWORD = "313hekmat"
-
+RUBIKA_TOKEN = os.environ.get("RUBIKA_TOKEN")
+BALE_TOKEN = os.environ.get("BALE_TOKEN")
+BOT_PASSWORD = os.environ.get("BOT_PASSWORD")
 RUBIKA_API = f"https://botapi.rubika.ir/v3/{RUBIKA_TOKEN}"
 BALE_API = f"https://tapi.bale.ai/bot{BALE_TOKEN}"
 DATA_FILE = "bot_data.json"
@@ -261,7 +260,7 @@ def run_bot():
                     send_rubika_msg(chat_id, "سلام! لطفاً رمز عبور را ارسال کنید:")
                     continue
 
-                if "313hekmat" in norm_text:
+                if norm_text == BOT_PASSWORD:
                     user["auth"] = True
                     data_store["users"][sender_id] = user
                     save_data(data_store)
