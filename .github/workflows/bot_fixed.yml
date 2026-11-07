@@ -1,0 +1,38 @@
+name: Run Converter Bot
+
+on:
+  schedule:
+    - cron: '58 */5 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: run-converter-bot
+  cancel-in-progress: true
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt update
+          sudo apt install -y ffmpeg
+
+      - name: Install Python Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Bot
+        env:
+          RUBIKA_TOKEN: ${{ secrets.RUBIKA_TOKEN }}
+          BALE_TOKEN: ${{ secrets.BALE_TOKEN }}
+          BOT_PASSWORD: ${{ secrets.BOT_PASSWORD }}
+        run: python bot.py
