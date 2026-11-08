@@ -3,10 +3,13 @@ import sys
 import time
 import json
 import queue
+import shutil
 import threading
 import subprocess
+import urllib3
 import requests
 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 sys.stdout.reconfigure(line_buffering=True)
 
 BOT_START_TIME = int(time.time())
@@ -20,8 +23,10 @@ BALE_API = f"https://tapi.bale.ai/bot{BALE_TOKEN}"
 DATA_FILE = "bot_data.json"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "*/*"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Encoding": "identity",  # جلوگیری از باگ فشرده‌سازی خالی در CDN روبیکا
+    "Connection": "keep-alive"
 }
 
 task_queue = queue.Queue()
@@ -68,8 +73,15 @@ def get_rubika_file_url(file_id):
     payload = {"file_id": str(file_id)}
     try:
         res = requests.post(url, json=payload, headers=HEADERS, timeout=15).json()
+        print(f"[Rubika getFile Response]: {res}", flush=True)
         data_obj = res.get("data", {}) if isinstance(res.get("data"), dict) else res
-        return data_obj.get("download_url") or res.get("download_url")
+        dl_url = (
+            data_obj.get("download_url")
+            or res.get("download_url")
+            or data_obj.get("file_url")
+            or data_obj.get("url")
+        )
+        return str(dl_url).strip() if dl_url else None
     except Exception as e:
         print(f"[Rubika File Error]: {e}", flush=True)
         return None
@@ -100,35 +112,72 @@ def send_bale_audio(chat_id, file_path, title="صوت"):
         print(f"[Bale Upload Exception]: {e}", flush=True)
         return False
 
-# ==================== دانلود مقاوم با قابلیت Resume ====================
-def download_file_tolerant(url, dest_path, timeout=180):
-    """دانلود فایل با تحمل قطعی شبکه و بررسی صحت دریافت بایت‌ها"""
-    try:
-        with requests.get(url, headers=HEADERS, stream=True, timeout=timeout, verify=False) as r:
-            if r.status_code not in (200, 206):
-                return False, f"HTTP Error {r.status_code}"
-            with open(dest_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=16384):
-                    if chunk:
-                        f.write(chunk)
-        if os.path.exists(dest_path) and os.path.getsize(dest_path) > 100:
-            return True, "OK"
-        return False, "فایل دانلود شده خالی است"
-    except Exception as e:
-        if os.path.exists(dest_path) and os.path.getsize(dest_path) > 512:
-            print(f"[Download Partial Saved]: {e} ({os.path.getsize(dest_path)} bytes)", flush=True)
-            return True, f"Partial: {e}"
-        return False, str(e)
+# ==================== دانلودر ۳ لایه ضد باگ ۰ بایت ====================
+def download_file_robust(url, dest_path, file_id=None, timeout=180):
+    """
+    تلاش برای دانلود فایل با ۳ روش مختلف (Requests Session, Curl, Wget/FFmpeg)
+    تا مشکل ۰ بایت شدن فایل‌های روبیکا به طور کامل برطرف شود.
+    """
+    # --- روش اول: استفاده از curl سیستم‌عامل (بهترین روش برای دور زدن محدودیت CDN روبیکا) ---
+    if shutil.which("curl"):
+        try:
+            cmd_curl = [
+                "curl", "-L", "-k", "-s", "--retry", "3", "--retry-delay", "2",
+                "--max-time", str(timeout),
+                "-A", HEADERS["User-Agent"],
+                "-o", dest_path,
+                url
+            ]
+            subprocess.run(cmd_curl, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout + 10)
+            if os.path.exists(dest_path) and os.path.getsize(dest_path) > 100:
+                print(f"[Download Success via CURL]: {os.path.getsize(dest_path)} bytes", flush=True)
+                return True, "OK (curl)"
+        except Exception as e:
+            print(f"[Curl Download Error]: {e}", flush=True)
+
+    # --- روش دوم: دانلود با Requests (تلاش مجدد با گرفتن لینک تازه در صورت منقضی بودن) ---
+    for attempt in range(2):
+        current_url = get_rubika_file_url(file_id) if (attempt > 0 and file_id) else url
+        if not current_url:
+            current_url = url
+        try:
+            session = requests.Session()
+            r = session.get(current_url, headers=HEADERS, stream=True, timeout=timeout, verify=False, allow_redirects=True)
+            print(f"[Requests Attempt {attempt+1}] Status: {r.status_code}, Headers: {dict(r.headers)}", flush=True)
+
+            if r.status_code in (200, 206):
+                with open(dest_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=32768):
+                        if chunk:
+                            f.write(chunk)
+
+                if os.path.exists(dest_path) and os.path.getsize(dest_path) > 100:
+                    print(f"[Download Success via Requests]: {os.path.getsize(dest_path)} bytes", flush=True)
+                    return True, "OK (requests)"
+
+            # تلاش بدون stream=True (مستقیم r.content)
+            r_direct = session.get(current_url, headers=HEADERS, stream=False, timeout=timeout, verify=False)
+            if r_direct.content and len(r_direct.content) > 100:
+                with open(dest_path, "wb") as f:
+                    f.write(r_direct.content)
+                print(f"[Download Success via Direct Content]: {len(r_direct.content)} bytes", flush=True)
+                return True, "OK (direct)"
+
+        except Exception as e:
+            print(f"[Requests Exception Attempt {attempt+1}]: {e}", flush=True)
+            if os.path.exists(dest_path) and os.path.getsize(dest_path) > 512:
+                return True, "Partial Saved"
+
+        time.sleep(1)
+
+    return False, "سرور روبیکا ۰ بایت داده برگرداند"
 
 # ==================== موتور جراحی و بازیابی عمیق صوت ====================
 def is_valid_output(path):
     return os.path.exists(path) and os.path.getsize(path) > 512
 
 def carve_clean_stream(raw_path, carved_path):
-    """
-    حذف بایت‌های صفر (Null) یا هدرهای متلاشی‌شده M4A/MP4 از ابتدای فایل
-    و پیدا کردن اولین فریم صوتی معتبر (Sync Word) یا بلوک mdat
-    """
+    """جداسازی بخش صوتی از فایل‌های دارای هدر سوخته یا فاقد جدول moov"""
     try:
         with open(raw_path, "rb") as f:
             data = f.read()
@@ -136,21 +185,21 @@ def carve_clean_stream(raw_path, carved_path):
         if len(data) < 64:
             return False
 
-        # ۱. اگر فایل M4A/MP4 است که جدول moov ندارد، مستقیماً از داخل بلوک mdat (دیتای خام صوتی) ببریم
+        # ۱. اگر فایل M4A/MP4 است که جدول moov ندارد، از داخل بلوک mdat ببریم
         mdat_pos = data.find(b"mdat")
         if mdat_pos != -1 and mdat_pos + 4 < len(data):
             with open(carved_path, "wb") as f:
                 f.write(data[mdat_pos + 4:])
             return True
 
-        # ۲. حذف بایت‌های صفر ابتدایی (فایل‌هایی که اولشان سوخته است)
+        # ۲. حذف بایت‌های صفر ابتدایی
         stripped = data.lstrip(b"\x00")
         if len(stripped) < len(data) and len(stripped) > 128:
             with open(carved_path, "wb") as f:
                 f.write(stripped)
             return True
 
-        # ۳. جستجوی اولین فریم استاندارد صوتی (MP3/AAC Sync Word: 0xFF 0xF... یا OggS)
+        # ۳. جستجوی اولین فریم Ogg یا ADTS/MP3
         ogg_pos = data.find(b"OggS")
         if ogg_pos > 0:
             with open(carved_path, "wb") as f:
@@ -158,7 +207,6 @@ def carve_clean_stream(raw_path, carved_path):
             return True
 
         for i in range(min(len(data) - 2, 65536)):
-            # الگوی Sync برای فریم‌های ADTS AAC و MP3
             if data[i] == 0xFF and (data[i + 1] & 0xF0) in (0xF0, 0xE0):
                 if i > 0:
                     with open(carved_path, "wb") as f:
@@ -184,29 +232,32 @@ def run_ffmpeg(args, input_bytes=None):
     except Exception as e:
         return False, str(e)
 
-def repair_and_convert_to_mp3(input_path, output_path, target_kbps="24k"):
+def repair_and_convert_to_mp3(input_source, output_path, target_kbps="24k", is_url=False):
     """
-    موتور ۵ مرحله‌ای برای تعمیر هر نوع فایل صوتی خراب، بدون هدر یا ناقص
+    تعمیر فایل صوتی (چه فایل لوکال باشد چه مستقیماً لینک اینترنتی) و تبدیل به MP3
     """
     base_encode = ["-vn", "-c:a", "libmp3lame", "-ac", "1", "-ar", "24000", "-b:a", target_kbps, output_path]
 
-    # --- مرحله ۱: تبدیل مستقیم با نادیده گرفتن فریم‌های خراب ---
+    # --- مرحله ۱: تبدیل استاندارد با نادیده گرفتن فریم‌های خراب ---
     cmd1 = [
         "ffmpeg", "-y",
         "-fflags", "+discardcorrupt+genpts+igndts",
         "-err_detect", "ignore_err",
-        "-i", input_path,
+        "-i", input_source,
         "-af", "aresample=async=1:min_hard_comp=0.100000:first_pts=0"
     ] + base_encode
     ok, err = run_ffmpeg(cmd1)
     if is_valid_output(output_path):
-        print("[Repair] Stage 1 Success (Standard Tolerant)", flush=True)
+        print("[Repair] Stage 1 Success", flush=True)
         return True
     print(f"[Stage 1 Log]: {err[-250:]}", flush=True)
 
-    # --- مرحله ۲: ارسال فایل از طریق Pipe (دور زدن خطای Seek و جدول معیوب کانتینر) ---
+    if is_url:
+        return False
+
+    # --- مرحله ۲: ارسال فایل از طریق Pipe (دور زدن خطای ساختار کانتینر) ---
     try:
-        with open(input_path, "rb") as f:
+        with open(input_source, "rb") as f:
             raw_bytes = f.read()
 
         cmd2 = [
@@ -217,16 +268,15 @@ def repair_and_convert_to_mp3(input_path, output_path, target_kbps="24k"):
         ] + base_encode
         run_ffmpeg(cmd2, input_bytes=raw_bytes)
         if is_valid_output(output_path):
-            print("[Repair] Stage 2 Success (Pipe Stream Recovery)", flush=True)
+            print("[Repair] Stage 2 Success (Pipe Stream)", flush=True)
             return True
     except Exception as e:
         print(f"[Stage 2 Exception]: {e}", flush=True)
 
-    # --- مرحله ۳: جراحی بایت‌ها (استخراج بخش mdat یا حذف هدر سوخته) و تلاش مجدد ---
-    carved_path = input_path + ".carved"
+    # --- مرحله ۳: جراحی بایت‌ها و تلاش مجدد ---
+    carved_path = input_source + ".carved"
     try:
-        if carve_clean_stream(input_path, carved_path):
-            # تلاش با فایل جراحی شده روی فرمت‌های مختلف
+        if carve_clean_stream(input_source, carved_path):
             for fmt in [None, "aac", "mp3", "ogg", "amr", "flac", "wav"]:
                 cmd3 = ["ffmpeg", "-y", "-fflags", "+discardcorrupt+genpts", "-err_detect", "ignore_err"]
                 if fmt:
@@ -234,7 +284,7 @@ def repair_and_convert_to_mp3(input_path, output_path, target_kbps="24k"):
                 cmd3 += ["-i", carved_path] + base_encode
                 run_ffmpeg(cmd3)
                 if is_valid_output(output_path):
-                    print(f"[Repair] Stage 3 Success (Carved Stream as {fmt or 'auto'})", flush=True)
+                    print(f"[Repair] Stage 3 Success (Carved as {fmt or 'auto'})", flush=True)
                     return True
     finally:
         if os.path.exists(carved_path):
@@ -243,14 +293,14 @@ def repair_and_convert_to_mp3(input_path, output_path, target_kbps="24k"):
             except Exception:
                 pass
 
-    # --- مرحله ۴: اجبار دیموکسر (Forced Format) روی فایل اصلی بدون تکیه بر پسوند یا هدر ---
-    for fmt in ["mp3", "aac", "ogg", "amr", "GSM", "wav", "flac", "m4a"]:
+    # --- مرحله ۴: اجبار دیموکسر روی فایل اصلی ---
+    for fmt in ["mp3", "aac", "ogg", "amr", "wav", "flac", "m4a"]:
         cmd4 = [
             "ffmpeg", "-y",
             "-fflags", "+discardcorrupt+genpts+igndts",
             "-err_detect", "ignore_err",
             "-f", fmt,
-            "-i", input_path
+            "-i", input_source
         ] + base_encode
         run_ffmpeg(cmd4)
         if is_valid_output(output_path):
@@ -258,19 +308,17 @@ def repair_and_convert_to_mp3(input_path, output_path, target_kbps="24k"):
             return True
 
     # --- مرحله ۵: بازیابی اضطراری به عنوان موج خام (Raw PCM Rescue) ---
-    # اگر کل ساختار فایل متلاشی شده باشد یا فرمت ناشناخته باشد، آن را به صورت موج خام می‌خواند
-    # و با فیلتر باندپاس صدای قابل شنیدن تولید می‌کند تا هرگز عملیات شکست نخورد.
     cmd5 = [
         "ffmpeg", "-y",
         "-f", "s16le",
         "-ar", "16000",
         "-ac", "1",
-        "-i", input_path,
+        "-i", input_source,
         "-af", "highpass=f=120,lowpass=f=3800,volume=0.5"
     ] + base_encode
     run_ffmpeg(cmd5)
     if is_valid_output(output_path):
-        print("[Repair] Stage 5 Success (Emergency Raw PCM Rescue)", flush=True)
+        print("[Repair] Stage 5 Success (Emergency Raw PCM)", flush=True)
         return True
 
     return False
@@ -282,10 +330,10 @@ def process_single_task(task):
     rubika_chat_id = task["rubika_chat_id"]
     bale_chat_id = task["bale_chat_id"]
 
-    send_rubika_msg(rubika_chat_id, "⏳ دانلود فایل از روبیکا آغاز شد...")
+    send_rubika_msg(rubika_chat_id, "⏳ دریافت لینک و دانلود فایل از روبیکا آغاز شد...")
     download_url = get_rubika_file_url(file_id)
     if not download_url:
-        send_rubika_msg(rubika_chat_id, "❌ دریافت آدرس دانلود فایل ناموفق بود.")
+        send_rubika_msg(rubika_chat_id, "❌ دریافت آدرس دانلود فایل از سرور روبیکا ناموفق بود.")
         return
 
     ext = os.path.splitext(original_name)[1] or ".m4a"
@@ -294,31 +342,35 @@ def process_single_task(task):
     light_path = f"light_{file_id}.mp3"
 
     try:
-        success_download, msg = download_file_tolerant(download_url, raw_path, timeout=180)
-        if not success_download:
-            send_rubika_msg(rubika_chat_id, f"❌ خطا در دانلود فایل ({msg})")
-            return
+        success_download, msg = download_file_robust(download_url, raw_path, file_id=file_id, timeout=180)
 
-        raw_size_kb = os.path.getsize(raw_path) / 1024
-        send_rubika_msg(rubika_chat_id, f"🛠 فایل دریافت شد ({raw_size_kb:.1f} KB). در حال جراحی، ترمیم خرابی‌ها و تبدیل به MP3...")
+        converted = False
+        if success_download:
+            raw_size_kb = os.path.getsize(raw_path) / 1024
+            send_rubika_msg(rubika_chat_id, f"🛠 فایل دانلود شد ({raw_size_kb:.1f} KB). در حال تعمیر و تبدیل به MP3...")
+            converted = repair_and_convert_to_mp3(raw_path, mp3_path, target_kbps="24k", is_url=False)
+        else:
+            # لایه سوم: اگر دانلودر پایتون/curl فایل را نگرفت، لینک را مستقیماً به FFmpeg می‌دهیم
+            send_rubika_msg(rubika_chat_id, "⚡ در حال استریم و تعمیر مستقیم فایل از لینک سرور...")
+            fresh_url = get_rubika_file_url(file_id) or download_url
+            converted = repair_and_convert_to_mp3(fresh_url, mp3_path, target_kbps="24k", is_url=True)
 
-        # اجرای موتور ۵ مرحله‌ای تعمیر
-        converted = repair_and_convert_to_mp3(raw_path, mp3_path, target_kbps="24k")
-        if not converted:
-            send_rubika_msg(rubika_chat_id, "❌ فایل دانلود شده کاملاً خالی است (۰ بایت داده).")
+        if not converted or not is_valid_output(mp3_path):
+            send_rubika_msg(rubika_chat_id, f"❌ سرور روبیکا فایل را خالی ارسال کرد ({msg}). لطفاً فایل را مجدداً فوروارد کنید.")
             return
 
         size_mb = os.path.getsize(mp3_path) / (1024 * 1024)
         print(f"[Repaired MP3 Size]: {size_mb:.2f} MB", flush=True)
 
         clean_title = os.path.splitext(original_name)[0] if original_name else "صوت"
-        send_rubika_msg(rubika_chat_id, f"🚀 صوت ترمیم شد (حجم: {size_mb:.2f}MB). در حال ارسال به بله...")
+        send_rubika_msg(rubika_chat_id, f"🚀 صوت آماده شد (حجم: {size_mb:.2f}MB). در حال ارسال به بله...")
 
         if send_bale_audio(bale_chat_id, mp3_path, title=clean_title):
             send_rubika_msg(rubika_chat_id, "✅ فایل با موفقیت تعمیر و به بله تحویل داده شد!")
         else:
             print("[Retrying with 16k ultra-light]...", flush=True)
-            if repair_and_convert_to_mp3(raw_path, light_path, target_kbps="16k") and send_bale_audio(bale_chat_id, light_path, title=clean_title):
+            source_for_light = raw_path if os.path.exists(raw_path) and os.path.getsize(raw_path) > 100 else mp3_path
+            if repair_and_convert_to_mp3(source_for_light, light_path, target_kbps="16k") and send_bale_audio(bale_chat_id, light_path, title=clean_title):
                 send_rubika_msg(rubika_chat_id, "✅ فایل با موفقیت به بله تحویل داده شد!")
             else:
                 send_rubika_msg(rubika_chat_id, "❌ خطای شبکه بله در تحویل فایل.")
@@ -370,9 +422,7 @@ def bale_listener():
 
 # ==================== حلقه اصلی روبیکا ====================
 def run_bot():
-    # غیرفعال کردن هشدارهای SSL برای پایداری بیشتر روی سرورهای مختلف
-    requests.packages.urllib3.disable_warnings()
-    print(">>> ربات با موتور ۵ مرحله‌ای جراحی و ترمیم صوت فعال شد...", flush=True)
+    print(">>> ربات با دانلودر ۳ لایه و موتور ترمیم صوت فعال شد...", flush=True)
 
     threading.Thread(target=queue_worker, daemon=True).start()
     threading.Thread(target=bale_listener, daemon=True).start()
@@ -414,7 +464,6 @@ def run_bot():
                 raw_text = (msg.get("text") or "").strip()
                 norm_text = normalize(raw_text)
 
-                # پشتیبانی از تمام کلیدهای احتمالی فایل، ویس یا موزیک در API روبیکا
                 file_info = msg.get("file") or msg.get("voice") or msg.get("audio") or msg.get("music")
 
                 user = data_store["users"].get(sender_id, {"auth": False, "bale_id": None})
@@ -463,7 +512,7 @@ def run_bot():
                         "rubika_chat_id": chat_id,
                         "bale_chat_id": user["bale_id"]
                     })
-                    send_rubika_msg(chat_id, f"📥 فایل دریافت شد و در صف تعمیر قرار گرفت (نوبت: {task_queue.qsize()})")
+                    send_rubika_msg(chat_id, f"📥 فایل دریافت شد و در صف قرار گرفت (نوبت: {task_queue.qsize()})")
 
         except Exception as e:
             print(f"[Polling Error]: {e}", flush=True)
