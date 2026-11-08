@@ -23,9 +23,8 @@ BALE_API = f"https://tapi.bale.ai/bot{BALE_TOKEN}"
 DATA_FILE = "bot_data.json"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-G990E) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
     "Accept": "*/*",
-    "Accept-Encoding": "identity",  # جلوگیری از باگ فشرده‌سازی خالی در CDN روبیکا
     "Connection": "keep-alive"
 }
 
@@ -68,7 +67,8 @@ def send_rubika_msg(chat_id, text):
     except Exception as e:
         print(f"[Rubika Send Error]: {e}", flush=True)
 
-def get_rubika_file_url(file_id):
+def get_rubika_file_info(file_id):
+    """دریافت آدرس دانلود و اطلاعات حجم فایل از سرور روبیکا"""
     url = f"{RUBIKA_API}/getFile"
     payload = {"file_id": str(file_id)}
     try:
@@ -81,10 +81,11 @@ def get_rubika_file_url(file_id):
             or data_obj.get("file_url")
             or data_obj.get("url")
         )
-        return str(dl_url).strip() if dl_url else None
+        size = int(data_obj.get("size") or res.get("size") or 0)
+        return (str(dl_url).strip() if dl_url else None), size
     except Exception as e:
         print(f"[Rubika File Error]: {e}", flush=True)
-        return None
+        return None, 0
 
 # ==================== بله ====================
 def send_bale_msg(chat_id, text):
@@ -112,72 +113,176 @@ def send_bale_audio(chat_id, file_path, title="صوت"):
         print(f"[Bale Upload Exception]: {e}", flush=True)
         return False
 
-# ==================== دانلودر ۳ لایه ضد باگ ۰ بایت ====================
-def download_file_robust(url, dest_path, file_id=None, timeout=180):
-    """
-    تلاش برای دانلود فایل با ۳ روش مختلف (Requests Session, Curl, Wget/FFmpeg)
-    تا مشکل ۰ بایت شدن فایل‌های روبیکا به طور کامل برطرف شود.
-    """
-    # --- روش اول: استفاده از curl سیستم‌عامل (بهترین روش برای دور زدن محدودیت CDN روبیکا) ---
-    if shutil.which("curl"):
-        try:
-            cmd_curl = [
-                "curl", "-L", "-k", "-s", "--retry", "3", "--retry-delay", "2",
-                "--max-time", str(timeout),
-                "-A", HEADERS["User-Agent"],
-                "-o", dest_path,
-                url
-            ]
-            subprocess.run(cmd_curl, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout + 10)
-            if os.path.exists(dest_path) and os.path.getsize(dest_path) > 100:
-                print(f"[Download Success via CURL]: {os.path.getsize(dest_path)} bytes", flush=True)
-                return True, "OK (curl)"
-        except Exception as e:
-            print(f"[Curl Download Error]: {e}", flush=True)
+# ==================== دانلودر پیشرفته بلوک‌به‌بلوک (ضد باگ ۰ بایت) ====================
+def is_valid_binary_chunk(data):
+    """بررسی اینکه داده دریافتی یک پیام خطای متنی/JSON از سمت سرور نباشد"""
+    if not data:
+        return False
+    stripped = data.lstrip()
+    if len(stripped) < 300 and (
+        stripped.startswith(b'{"status"')
+        or stripped.startswith(b"<!DOCTYPE")
+        or stripped.startswith(b"<html")
+    ):
+        return False
+    return True
 
-    # --- روش دوم: دانلود با Requests (تلاش مجدد با گرفتن لینک تازه در صورت منقضی بودن) ---
-    for attempt in range(2):
-        current_url = get_rubika_file_url(file_id) if (attempt > 0 and file_id) else url
-        if not current_url:
-            current_url = url
-        try:
+def is_valid_downloaded_file(path):
+    if not os.path.exists(path) or os.path.getsize(path) <= 64:
+        return False
+    try:
+        with open(path, "rb") as f:
+            head = f.read(512)
+        return is_valid_binary_chunk(head)
+    except Exception:
+        return False
+
+def download_chunked_rubika(url, dest_path, expected_size=0, timeout=180):
+    """
+    دانلود تکه‌تکه (Chunked) با پروتکل اختصاصی روبیکا (start-byte / last-byte و Range).
+    اگر فایل روی سرور روبیکا ناقص یا خراب باشد، تمام بلوک‌های سالم از بایت 0 تا نقطه خرابی را استخراج می‌کند.
+    """
+    header_profiles = [
+        lambda s, e: {**HEADERS, "start-byte": str(s), "last-byte": str(e), "Range": f"bytes={s}-{e}"},
+        lambda s, e: {**HEADERS, "start-byte": str(s), "last-byte": str(e)},
+        lambda s, e: {**HEADERS, "Range": f"bytes={s}-{e}"},
+    ]
+
+    for profile_idx, make_headers in enumerate(header_profiles):
+        for method in ["GET", "POST"]:
+            offset = 0
+            chunk_size = 262144  # شروع با بلوک‌های ۲۵۶ کیلوبایتی
+            total_written = 0
+            consecutive_failures = 0
             session = requests.Session()
-            r = session.get(current_url, headers=HEADERS, stream=True, timeout=timeout, verify=False, allow_redirects=True)
-            print(f"[Requests Attempt {attempt+1}] Status: {r.status_code}, Headers: {dict(r.headers)}", flush=True)
 
-            if r.status_code in (200, 206):
+            try:
                 with open(dest_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=32768):
-                        if chunk:
-                            f.write(chunk)
+                    while True:
+                        end_byte = offset + chunk_size - 1
+                        req_headers = make_headers(offset, end_byte)
+                        try:
+                            if method == "GET":
+                                r = session.get(url, headers=req_headers, timeout=25, verify=False, allow_redirects=True)
+                            else:
+                                r = session.post(url, headers=req_headers, timeout=25, verify=False, allow_redirects=True)
 
-                if os.path.exists(dest_path) and os.path.getsize(dest_path) > 100:
-                    print(f"[Download Success via Requests]: {os.path.getsize(dest_path)} bytes", flush=True)
-                    return True, "OK (requests)"
+                            content = r.content
+                            if r.status_code in (200, 206) and is_valid_binary_chunk(content):
+                                f.write(content)
+                                f.flush()
+                                received_len = len(content)
+                                total_written += received_len
+                                offset += received_len
+                                consecutive_failures = 0
 
-            # تلاش بدون stream=True (مستقیم r.content)
-            r_direct = session.get(current_url, headers=HEADERS, stream=False, timeout=timeout, verify=False)
-            if r_direct.content and len(r_direct.content) > 100:
-                with open(dest_path, "wb") as f:
-                    f.write(r_direct.content)
-                print(f"[Download Success via Direct Content]: {len(r_direct.content)} bytes", flush=True)
-                return True, "OK (direct)"
+                                # بررسی اتمام فایل بر اساس هدرهای سرور روبیکا
+                                total_len_hdr = int(r.headers.get("total_length") or 0)
+                                if total_len_hdr > 0 and offset >= total_len_hdr:
+                                    break
+                                if expected_size > 0 and offset >= expected_size:
+                                    break
+                                # اگر سرور کل فایل را یکجا برگردانده باشد یا به انتهای فایل رسیده باشیم
+                                if received_len < chunk_size and (r.status_code == 200 and "Content-Range" not in r.headers and not r.headers.get("total_length")):
+                                    break
+                                if received_len == 0:
+                                    break
+                            else:
+                                # اگر بلوک فعلی به دلیل خرابی بخشی از فایل روی سرور رد شد، بلوک را کوچک‌تر کن تا حداکثر بایت‌های سالم استخراج شوند
+                                if total_written > 0 and chunk_size > 16384:
+                                    chunk_size = 16384
+                                    continue
+                                consecutive_failures += 1
+                                if consecutive_failures >= 2:
+                                    break
+                        except Exception as e:
+                            print(f"[Chunk Error at offset {offset}]: {e}", flush=True)
+                            if total_written > 0 and chunk_size > 16384:
+                                chunk_size = 16384
+                                continue
+                            break
 
-        except Exception as e:
-            print(f"[Requests Exception Attempt {attempt+1}]: {e}", flush=True)
-            if os.path.exists(dest_path) and os.path.getsize(dest_path) > 512:
-                return True, "Partial Saved"
+                if total_written > 64 and is_valid_downloaded_file(dest_path):
+                    print(f"[Chunked Download Success] Profile {profile_idx+1} ({method}): {total_written} bytes", flush=True)
+                    return True
+            except Exception as e:
+                print(f"[Chunked Session Error]: {e}", flush=True)
 
-        time.sleep(1)
+    return False
 
-    return False, "سرور روبیکا ۰ بایت داده برگرداند"
+def download_raw_socket_stream(url, dest_path, timeout=120):
+    """
+    خواندن مستقیم از سوکت شبکه با نادیده گرفتن هدر کاذب Content-Length: 0
+    """
+    try:
+        session = requests.Session()
+        r = session.get(url, headers=HEADERS, stream=True, timeout=timeout, verify=False)
+        # خنثی‌سازی محدودیت Content-Length: 0 در سطح سوکت urllib3/http.client
+        if hasattr(r.raw, "_fp") and r.raw._fp is not None:
+            if hasattr(r.raw._fp, "length"):
+                r.raw._fp.length = None
+        total = 0
+        with open(dest_path, "wb") as f:
+            while True:
+                chunk = r.raw.read(32768)
+                if not chunk:
+                    break
+                f.write(chunk)
+                total += len(chunk)
+        r.close()
+        if total > 64 and is_valid_downloaded_file(dest_path):
+            print(f"[Raw Socket Stream Success]: {total} bytes", flush=True)
+            return True
+    except Exception as e:
+        print(f"[Raw Socket Stream Error]: {e}", flush=True)
+        if is_valid_downloaded_file(dest_path):
+            return True
+    return False
+
+def download_file_ultimate(url, dest_path, file_id=None, expected_size=0, timeout=180):
+    """
+    سیستم دانلود ۴ لایه برای استخراج فایل‌های خراب، ناقص یا دارای هدر ۰ بایت از سرورهای روبیکا
+    """
+    urls_to_try = [url]
+    if url.startswith("https://"):
+        urls_to_try.append("http://" + url[len("https://"):])
+
+    for attempt_url in urls_to_try:
+        # لایه ۱: استفاده از curl با پرچم --ignore-content-length و --http1.1
+        if shutil.which("curl"):
+            try:
+                cmd_curl = [
+                    "curl", "--http1.1", "--ignore-content-length", "-L", "-k", "-s",
+                    "--retry", "2", "--max-time", str(timeout),
+                    "-A", HEADERS["User-Agent"],
+                    "-o", dest_path,
+                    attempt_url
+                ]
+                subprocess.run(cmd_curl, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout + 10)
+                if is_valid_downloaded_file(dest_path):
+                    print(f"[Download Success via CURL ignore-length]: {os.path.getsize(dest_path)} bytes", flush=True)
+                    return True, "OK (curl)"
+            except Exception as e:
+                print(f"[Curl Error]: {e}", flush=True)
+
+        # لایه ۲: خواندن مستقیم سوکت با دور زدن Content-Length: 0
+        if download_raw_socket_stream(attempt_url, dest_path, timeout=60):
+            return True, "OK (raw-socket)"
+
+        # لایه ۳: دانلود تکه‌تکه (Chunked) با هدرهای start-byte / last-byte و Range
+        fresh_url, fresh_size = get_rubika_file_info(file_id) if file_id else (attempt_url, expected_size)
+        target_url = fresh_url or attempt_url
+        if download_chunked_rubika(target_url, dest_path, expected_size=fresh_size or expected_size, timeout=timeout):
+            return True, "OK (chunked)"
+
+    return False, f"اندازه ثبت‌شده در سرور روبیکا: {expected_size} بایت"
 
 # ==================== موتور جراحی و بازیابی عمیق صوت ====================
 def is_valid_output(path):
     return os.path.exists(path) and os.path.getsize(path) > 512
 
 def carve_clean_stream(raw_path, carved_path):
-    """جداسازی بخش صوتی از فایل‌های دارای هدر سوخته یا فاقد جدول moov"""
+    """جداسازی فریم‌های صوتی معتبر از فایل‌های دارای هدر سوخته یا ناقص"""
     try:
         with open(raw_path, "rb") as f:
             data = f.read()
@@ -185,28 +290,36 @@ def carve_clean_stream(raw_path, carved_path):
         if len(data) < 64:
             return False
 
-        # ۱. اگر فایل M4A/MP4 است که جدول moov ندارد، از داخل بلوک mdat ببریم
-        mdat_pos = data.find(b"mdat")
-        if mdat_pos != -1 and mdat_pos + 4 < len(data):
-            with open(carved_path, "wb") as f:
-                f.write(data[mdat_pos + 4:])
-            return True
-
-        # ۲. حذف بایت‌های صفر ابتدایی
-        stripped = data.lstrip(b"\x00")
-        if len(stripped) < len(data) and len(stripped) > 128:
-            with open(carved_path, "wb") as f:
-                f.write(stripped)
-            return True
-
-        # ۳. جستجوی اولین فریم Ogg یا ADTS/MP3
+        # ۱. بررسی بلوک OggS (ویس‌های روبیکا)
         ogg_pos = data.find(b"OggS")
         if ogg_pos > 0:
             with open(carved_path, "wb") as f:
                 f.write(data[ogg_pos:])
             return True
 
-        for i in range(min(len(data) - 2, 65536)):
+        # ۲. بررسی تگ ID3 در فایل‌های MP3 که ابتدای آن‌ها بایت اضافی دارد
+        id3_pos = data.find(b"ID3")
+        if id3_pos > 0:
+            with open(carved_path, "wb") as f:
+                f.write(data[id3_pos:])
+            return True
+
+        # ۳. بررسی بلوک mdat در فایل‌های M4A/MP4 بدون جدول moov
+        mdat_pos = data.find(b"mdat")
+        if mdat_pos != -1 and mdat_pos + 4 < len(data):
+            with open(carved_path, "wb") as f:
+                f.write(data[mdat_pos + 4:])
+            return True
+
+        # ۴. حذف بایت‌های صفر ابتدایی
+        stripped = data.lstrip(b"\x00")
+        if len(stripped) < len(data) and len(stripped) > 128:
+            with open(carved_path, "wb") as f:
+                f.write(stripped)
+            return True
+
+        # ۵. جستجوی اولین الگوی Sync فریم صوتی (MP3/AAC)
+        for i in range(min(len(data) - 2, 131072)):
             if data[i] == 0xFF and (data[i + 1] & 0xF0) in (0xF0, 0xE0):
                 if i > 0:
                     with open(carved_path, "wb") as f:
@@ -234,11 +347,11 @@ def run_ffmpeg(args, input_bytes=None):
 
 def repair_and_convert_to_mp3(input_source, output_path, target_kbps="24k", is_url=False):
     """
-    تعمیر فایل صوتی (چه فایل لوکال باشد چه مستقیماً لینک اینترنتی) و تبدیل به MP3
+    موتور ۵ مرحله‌ای برای تعمیر فایل صوتی آسیب‌دیده و تبدیل به MP3
     """
     base_encode = ["-vn", "-c:a", "libmp3lame", "-ac", "1", "-ar", "24000", "-b:a", target_kbps, output_path]
 
-    # --- مرحله ۱: تبدیل استاندارد با نادیده گرفتن فریم‌های خراب ---
+    # --- مرحله ۱: تبدیل استاندارد با دور ریختن پکت‌های معیوب و بازسازی تایم‌استمپ ---
     cmd1 = [
         "ffmpeg", "-y",
         "-fflags", "+discardcorrupt+genpts+igndts",
@@ -255,29 +368,28 @@ def repair_and_convert_to_mp3(input_source, output_path, target_kbps="24k", is_u
     if is_url:
         return False
 
-    # --- مرحله ۲: ارسال فایل از طریق Pipe (دور زدن خطای ساختار کانتینر) ---
+    # --- مرحله ۲: تزریق از طریق Pipe (دور زدن خطای Seek در فایل‌های ناقص) ---
     try:
         with open(input_source, "rb") as f:
             raw_bytes = f.read()
 
-        cmd2 = [
-            "ffmpeg", "-y",
-            "-fflags", "+discardcorrupt+genpts+igndts",
-            "-err_detect", "ignore_err",
-            "-i", "pipe:0"
-        ] + base_encode
-        run_ffmpeg(cmd2, input_bytes=raw_bytes)
-        if is_valid_output(output_path):
-            print("[Repair] Stage 2 Success (Pipe Stream)", flush=True)
-            return True
+        for fmt in [None, "mp3", "aac", "ogg", "amr", "wav", "flac"]:
+            cmd2 = ["ffmpeg", "-y", "-fflags", "+discardcorrupt+genpts+igndts", "-err_detect", "ignore_err"]
+            if fmt:
+                cmd2 += ["-f", fmt]
+            cmd2 += ["-i", "pipe:0"] + base_encode
+            run_ffmpeg(cmd2, input_bytes=raw_bytes)
+            if is_valid_output(output_path):
+                print(f"[Repair] Stage 2 Success (Pipe as {fmt or 'auto'})", flush=True)
+                return True
     except Exception as e:
         print(f"[Stage 2 Exception]: {e}", flush=True)
 
-    # --- مرحله ۳: جراحی بایت‌ها و تلاش مجدد ---
+    # --- مرحله ۳: جراحی بایت‌ها (حذف هدرهای سوخته) و تلاش مجدد ---
     carved_path = input_source + ".carved"
     try:
         if carve_clean_stream(input_source, carved_path):
-            for fmt in [None, "aac", "mp3", "ogg", "amr", "flac", "wav"]:
+            for fmt in [None, "mp3", "aac", "ogg", "amr", "flac", "wav"]:
                 cmd3 = ["ffmpeg", "-y", "-fflags", "+discardcorrupt+genpts", "-err_detect", "ignore_err"]
                 if fmt:
                     cmd3 += ["-f", fmt]
@@ -307,7 +419,7 @@ def repair_and_convert_to_mp3(input_source, output_path, target_kbps="24k", is_u
             print(f"[Repair] Stage 4 Success (Forced Format: {fmt})", flush=True)
             return True
 
-    # --- مرحله ۵: بازیابی اضطراری به عنوان موج خام (Raw PCM Rescue) ---
+    # --- مرحله ۵: بازیابی اضطراری به عنوان موج خام صوتی (Raw PCM Rescue) ---
     cmd5 = [
         "ffmpeg", "-y",
         "-f", "s16le",
@@ -327,11 +439,14 @@ def repair_and_convert_to_mp3(input_source, output_path, target_kbps="24k", is_u
 def process_single_task(task):
     file_id = task["file_id"]
     original_name = task["original_name"]
+    msg_file_size = task.get("file_size", 0)
     rubika_chat_id = task["rubika_chat_id"]
     bale_chat_id = task["bale_chat_id"]
 
-    send_rubika_msg(rubika_chat_id, "⏳ دریافت لینک و دانلود فایل از روبیکا آغاز شد...")
-    download_url = get_rubika_file_url(file_id)
+    send_rubika_msg(rubika_chat_id, "⏳ دریافت لینک و استخراج بلوک‌های فایل از روبیکا آغاز شد...")
+    download_url, api_file_size = get_rubika_file_info(file_id)
+    expected_size = api_file_size or msg_file_size
+
     if not download_url:
         send_rubika_msg(rubika_chat_id, "❌ دریافت آدرس دانلود فایل از سرور روبیکا ناموفق بود.")
         return
@@ -342,34 +457,43 @@ def process_single_task(task):
     light_path = f"light_{file_id}.mp3"
 
     try:
-        success_download, msg = download_file_robust(download_url, raw_path, file_id=file_id, timeout=180)
+        success_download, msg = download_file_ultimate(
+            download_url,
+            raw_path,
+            file_id=file_id,
+            expected_size=expected_size,
+            timeout=180
+        )
 
         converted = False
         if success_download:
             raw_size_kb = os.path.getsize(raw_path) / 1024
-            send_rubika_msg(rubika_chat_id, f"🛠 فایل دانلود شد ({raw_size_kb:.1f} KB). در حال تعمیر و تبدیل به MP3...")
+            send_rubika_msg(rubika_chat_id, f"🛠 فایل استخراج شد ({raw_size_kb:.1f} KB). در حال تعمیر و تبدیل به MP3...")
             converted = repair_and_convert_to_mp3(raw_path, mp3_path, target_kbps="24k", is_url=False)
         else:
-            # لایه سوم: اگر دانلودر پایتون/curl فایل را نگرفت، لینک را مستقیماً به FFmpeg می‌دهیم
-            send_rubika_msg(rubika_chat_id, "⚡ در حال استریم و تعمیر مستقیم فایل از لینک سرور...")
-            fresh_url = get_rubika_file_url(file_id) or download_url
-            converted = repair_and_convert_to_mp3(fresh_url, mp3_path, target_kbps="24k", is_url=True)
+            send_rubika_msg(rubika_chat_id, "⚡ در حال تلاش نهایی برای استریم مستقیم از سرور روبیکا...")
+            fresh_url, _ = get_rubika_file_info(file_id)
+            converted = repair_and_convert_to_mp3(fresh_url or download_url, mp3_path, target_kbps="24k", is_url=True)
 
         if not converted or not is_valid_output(mp3_path):
-            send_rubika_msg(rubika_chat_id, f"❌ سرور روبیکا فایل را خالی ارسال کرد ({msg}). لطفاً فایل را مجدداً فوروارد کنید.")
+            send_rubika_msg(
+                rubika_chat_id,
+                f"❌ این فایل روی سرورهای API روبیکا هیچ بایت صوتی ندارد ({msg}).\n"
+                f"💡 نکته: اگر فایل در گوشی شما پخش می‌شود، آن را یک بار ذخیره و به عنوان یک فایل جدید آپلود کنید (فوروارد نکنید)."
+            )
             return
 
         size_mb = os.path.getsize(mp3_path) / (1024 * 1024)
         print(f"[Repaired MP3 Size]: {size_mb:.2f} MB", flush=True)
 
         clean_title = os.path.splitext(original_name)[0] if original_name else "صوت"
-        send_rubika_msg(rubika_chat_id, f"🚀 صوت آماده شد (حجم: {size_mb:.2f}MB). در حال ارسال به بله...")
+        send_rubika_msg(rubika_chat_id, f"🚀 صوت تعمیر شد (حجم: {size_mb:.2f}MB). در حال ارسال به بله...")
 
         if send_bale_audio(bale_chat_id, mp3_path, title=clean_title):
             send_rubika_msg(rubika_chat_id, "✅ فایل با موفقیت تعمیر و به بله تحویل داده شد!")
         else:
             print("[Retrying with 16k ultra-light]...", flush=True)
-            source_for_light = raw_path if os.path.exists(raw_path) and os.path.getsize(raw_path) > 100 else mp3_path
+            source_for_light = raw_path if is_valid_downloaded_file(raw_path) else mp3_path
             if repair_and_convert_to_mp3(source_for_light, light_path, target_kbps="16k") and send_bale_audio(bale_chat_id, light_path, title=clean_title):
                 send_rubika_msg(rubika_chat_id, "✅ فایل با موفقیت به بله تحویل داده شد!")
             else:
@@ -422,7 +546,7 @@ def bale_listener():
 
 # ==================== حلقه اصلی روبیکا ====================
 def run_bot():
-    print(">>> ربات با دانلودر ۳ لایه و موتور ترمیم صوت فعال شد...", flush=True)
+    print(">>> ربات با دانلودر بلوک‌به‌بلوک (Chunked) و موتور ترمیم صوت فعال شد...", flush=True)
 
     threading.Thread(target=queue_worker, daemon=True).start()
     threading.Thread(target=bale_listener, daemon=True).start()
@@ -505,10 +629,12 @@ def run_bot():
                 if file_info:
                     file_id = file_info.get("file_id")
                     file_name = file_info.get("file_name") or "voice.m4a"
+                    file_size = int(file_info.get("size") or 0)
 
                     task_queue.put({
                         "file_id": file_id,
                         "original_name": file_name,
+                        "file_size": file_size,
                         "rubika_chat_id": chat_id,
                         "bale_chat_id": user["bale_id"]
                     })
