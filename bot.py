@@ -92,7 +92,6 @@ def send_bale_audio(chat_id, file_path, title="صوت"):
         with open(file_path, "rb") as f:
             files = {"audio": (os.path.basename(file_path), f, "audio/mpeg")}
             data = {"chat_id": str(chat_id), "caption": f"🎵 {title}"}
-            # تایم‌اوت مناسب برای فایل‌های سبک زیر ۱۰ مگابایت
             res = requests.post(url, data=data, files=files, timeout=180)
             res_json = res.json()
             print(f"[Bale Response]: {res_json}", flush=True)
@@ -101,16 +100,65 @@ def send_bale_audio(chat_id, file_path, title="صوت"):
         print(f"[Bale Upload Exception]: {e}", flush=True)
         return False
 
-# ==================== فشرده‌سازی هوشمند گفتار ====================
-def convert_to_mp3(input_path, output_path, target_kbps="24k"):
-    # نرخ ۲۴k مونو همراه فرکانس ۲۴۰۰۰ هرتز؛ فوق‌العاده رسا برای کلام و حجم زیر ۱۰ مگابایت
-    cmd = [
-        "ffmpeg", "-y", "-i", input_path,
-        "-vn", "-c:a", "libmp3lame", "-ac", "1", "-ar", "24000", "-b:a", target_kbps,
+# ==================== دانلود مقاوم و تعمیر فایل ====================
+def download_file_tolerant(url, dest_path, timeout=180):
+    """دانلود با تحمل قطعی؛ هر مقدار بایت دریافتی را تا جای ممکن ذخیره می‌کند."""
+    try:
+        with requests.get(url, headers=HEADERS, stream=True, timeout=timeout) as r:
+            if r.status_code != 200:
+                return False, f"HTTP Error {r.status_code}"
+            with open(dest_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=32768):
+                    if chunk:
+                        f.write(chunk)
+        return True, "OK"
+    except Exception as e:
+        # اگر مقداری از داده ذخیره شده باشد، فایل برای تعمیر قابل استفاده است
+        if os.path.exists(dest_path) and os.path.getsize(dest_path) > 1024:
+            print(f"[Download Partial Warning]: {e} (saved {os.path.getsize(dest_path)} bytes)", flush=True)
+            return True, f"Partial: {e}"
+        return False, str(e)
+
+def repair_and_convert_to_mp3(input_path, output_path, target_kbps="24k"):
+    """
+    تعمیر فایل خراب و تبدیل آن به MP3 استاندارد با پرچم‌های ترمیم خطای FFmpeg
+    """
+    # استراتژی اول: تعمیر استاندارد با چشم‌پوشی از فریم‌ها و متادیتای آسیب‌دیده
+    cmd_repair = [
+        "ffmpeg", "-y",
+        "-err_detect", "ignore_err",
+        "-fflags", "+discardcorrupt+genpts",
+        "-i", input_path,
+        "-vn",
+        "-af", "aresample=async=1000",
+        "-c:a", "libmp3lame",
+        "-ac", "1",
+        "-ar", "24000",
+        "-b:a", target_kbps,
         output_path
     ]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    return res.returncode == 0
+    res = subprocess.run(cmd_repair, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+        return True
+
+    print(f"[FFmpeg Standard Repair Failed]: {res.stderr[-300:] if res.stderr else ''}", flush=True)
+
+    # استراتژی دوم: تلاش با کالبدشکافی عمیق استریم‌های ناقص و ساختار آسیب‌دیده کانتینر
+    cmd_aggressive = [
+        "ffmpeg", "-y",
+        "-analyzeduration", "100M",
+        "-probesize", "100M",
+        "-fflags", "+genpts+igndts+flush_packets",
+        "-err_detect", "ignore_err",
+        "-i", input_path,
+        "-vn",
+        "-c:a", "libmp3lame",
+        "-ac", "1",
+        "-b:a", target_kbps,
+        output_path
+    ]
+    res2 = subprocess.run(cmd_aggressive, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return res2.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1000
 
 # ==================== پردازش فایل ====================
 def process_single_task(task):
@@ -131,35 +179,32 @@ def process_single_task(task):
     light_path = f"light_{file_id}.mp3"
 
     try:
-        with requests.get(download_url, headers=HEADERS, stream=True, timeout=180) as r:
-            if r.status_code != 200:
-                send_rubika_msg(rubika_chat_id, f"❌ سرور دانلود خطا داد ({r.status_code})")
-                return
-            with open(raw_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=32768):
-                    if chunk:
-                        f.write(chunk)
+        success_download, msg = download_file_tolerant(download_url, raw_path, timeout=180)
+        if not success_download:
+            send_rubika_msg(rubika_chat_id, f"❌ سرور دانلود خطا داد ({msg})")
+            return
 
-        send_rubika_msg(rubika_chat_id, "🔄 در حال تبدیل به MP3 فشرده و سبک...")
-        # تبدیل با ۲۴ کیلوبیت (حجم حدود ۹ تا ۱۰ مگابایت برای ۱ ساعت صوت)
-        success = convert_to_mp3(raw_path, mp3_path, target_kbps="24k")
-        if not success or not os.path.exists(mp3_path):
-            send_rubika_msg(rubika_chat_id, "❌ خطا در تبدیل به MP3.")
+        send_rubika_msg(rubika_chat_id, "🛠 در حال بررسی، تعمیر خرابی‌ها و تبدیل فایل به MP3...")
+        
+        # تبدیل و تعمیر با نرخ ۲۴ کیلوبیت
+        converted = repair_and_convert_to_mp3(raw_path, mp3_path, target_kbps="24k")
+        if not converted:
+            send_rubika_msg(rubika_chat_id, "❌ فایل به قدری آسیب دیده است که هیچ دیتای صوتی قابل بازیافتی یافت نشد.")
             return
 
         size_mb = os.path.getsize(mp3_path) / (1024 * 1024)
-        print(f"[Optimized MP3 Size]: {size_mb:.2f} MB", flush=True)
+        print(f"[Repaired MP3 Size]: {size_mb:.2f} MB", flush=True)
 
-        send_rubika_msg(rubika_chat_id, f"🚀 حجم فایل به {size_mb:.1f}MB کاهش یافت. در حال ارسال به بله...")
+        clean_title = os.path.splitext(original_name)[0] if original_name else "صوت"
+        send_rubika_msg(rubika_chat_id, f"🚀 صوت تعمیر شد (حجم: {size_mb:.1f}MB). در حال ارسال به بله...")
         
-        # تلاش برای ارسال فایل ۱۰ مگابایتی
-        if send_bale_audio(bale_chat_id, mp3_path, title=original_name or "صوت"):
-            send_rubika_msg(rubika_chat_id, "✅ فایل با موفقیت به بله تحویل داده شد!")
+        # ارسال فایل تعمیر شده
+        if send_bale_audio(bale_chat_id, mp3_path, title=clean_title):
+            send_rubika_msg(rubika_chat_id, "✅ فایل با موفقیت تعمیر و به بله تحویل داده شد!")
         else:
-            # در صورت بروز هرگونه تایم‌اوت مجدد، فایل را به ۱۶ کیلوبیت (حدود ۶ مگابایت) کاهش می‌دهد
+            # ارسال فایل با حجم سبک‌تر در صورت بروز مشکل اینترنت بله
             print("[Retrying with 16k ultra-light]...", flush=True)
-            convert_to_mp3(raw_path, light_path, target_kbps="16k")
-            if send_bale_audio(bale_chat_id, light_path, title=original_name or "صوت"):
+            if repair_and_convert_to_mp3(raw_path, light_path, target_kbps="16k") and send_bale_audio(bale_chat_id, light_path, title=clean_title):
                 send_rubika_msg(rubika_chat_id, "✅ فایل با موفقیت به بله تحویل داده شد!")
             else:
                 send_rubika_msg(rubika_chat_id, "❌ خطای شبکه بله در تحویل فایل.")
@@ -211,7 +256,7 @@ def bale_listener():
 
 # ==================== حلقه اصلی روبیکا ====================
 def run_bot():
-    print(">>> ربات با سیستم فوق سبک فعال شد...", flush=True)
+    print(">>> ربات با قابلیت تعمیر خودکار فایل‌های صوتی فعال شد...", flush=True)
 
     threading.Thread(target=queue_worker, daemon=True).start()
     threading.Thread(target=bale_listener, daemon=True).start()
@@ -290,6 +335,7 @@ def run_bot():
                     send_rubika_msg(chat_id, "⚠️ شناسه بله خود را ارسال نکرده‌اید.")
                     continue
 
+                # پردازش فایل صوتی ارسال شده
                 if file_info:
                     file_id = file_info.get("file_id")
                     file_name = file_info.get("file_name", "audio.m4a")
@@ -300,7 +346,7 @@ def run_bot():
                         "rubika_chat_id": chat_id,
                         "bale_chat_id": user["bale_id"]
                     })
-                    send_rubika_msg(chat_id, f"📥 فایل در صف پردازش قرار گرفت (نوبت: {task_queue.qsize()})")
+                    send_rubika_msg(chat_id, f"📥 فایل دریافت شد و در صف تعمیر/تبدیل قرار گرفت (نوبت: {task_queue.qsize()})")
 
         except Exception as e:
             print(f"[Polling Error]: {e}", flush=True)
