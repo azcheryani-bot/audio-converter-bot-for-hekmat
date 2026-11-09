@@ -5,6 +5,10 @@ on:
     - cron: '58 */5 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: read
+  actions: write
+
 concurrency:
   group: run-converter-bot
   cancel-in-progress: true
@@ -12,7 +16,6 @@ concurrency:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 358
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -35,4 +38,5 @@ jobs:
           RUBIKA_TOKEN: ${{ secrets.RUBIKA_TOKEN }}
           BALE_TOKEN: ${{ secrets.BALE_TOKEN }}
           BOT_PASSWORD: ${{ secrets.BOT_PASSWORD }}
-        run: python bot.py
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: exec python bot.py
